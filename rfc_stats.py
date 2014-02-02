@@ -19,6 +19,7 @@ Usage:
 import re
 import locale
 from datetime import datetime
+import codecs
 import wikitools
 import csv
 
@@ -363,7 +364,7 @@ class GlobalUser:
                                    ucuser=self.username, ucdir='newer', uclimit=1, ucprop='timestamp')['query']
 
             self.groups.extend(data['users'][0]['groups'])
-            if len(data['usercontribs']):
+            if len(data['usercontribs']) > 0:
                 first_edit_on_this_wiki = Api.timestamp_to_datetime(data['usercontribs'][0]['timestamp'])
                 if not self.first_edit or first_edit_on_this_wiki < self.first_edit:
                     self.first_edit = first_edit_on_this_wiki
@@ -422,19 +423,24 @@ class User:
                                 ususers=self.username, usprop='editcount|groups|registration',
                                 ucuser=self.username, ucdir='newer', uclimit=1, ucprop='timestamp',
                             meta='globaluserinfo', guiuser=self.username, guiprop='editcount|groups|merged')['query']
-        local_data = data['users'][0]
-        global_data = data['globaluserinfo']
-        first_local_edit = data['usercontribs'][0]['timestamp']
+        try:
+            local_data = data['users'][0]
+            global_data = data['globaluserinfo']
 
-        self.groups = local_data['groups']
-        self.editcount = local_data['editcount']
-        self.first_edit = Api.timestamp_to_datetime(first_local_edit)
+            self.groups = local_data['groups']
+            self.editcount = local_data['editcount']
 
-        if self.data_is_global(global_data):
-            self.global_user = GlobalUser.from_globaluserinfo(self.username, global_data)
-            #self.global_user.load_data()
-        else:
-            self.global_user = False
+            first_local_edit = data['usercontribs'][0]['timestamp']
+            self.first_edit = Api.timestamp_to_datetime(first_local_edit)
+
+            if self.data_is_global(global_data):
+                self.global_user = GlobalUser.from_globaluserinfo(self.username, global_data)
+                #self.global_user.load_data()
+            else:
+                self.global_user = False
+        except:
+            print(data)
+            raise
 
     def data_is_global(self, global_data):
         merged = False
@@ -462,4 +468,46 @@ class User:
             return None
 
 
+class CsvVoteWriter:
+    def __init__(self, filename):
+        self.filename = filename
+        self.file = None
+        self.writer = None
+
+        self.open()
+
+    def open(self):
+        self.file = open(self.filename, 'wt')
+        self.file.write(codecs.BOM_UTF8)
+
+        self.writer = csv.writer(self.file)
+        self.writerow(['User', '!vote section', '!vote date', 'Commons edit count', 'First Commons edit',
+                              'Global edit count', 'Home wiki', 'Full text'])
+
+    def writerow(self, row):
+        """
+        @type row: list
+        """
+        row = [s.encode('utf-8') if type(s) is str or type(s) is unicode else str(s) for s in row]
+        self.writer.writerow(row)
+
+    def write(self, vote):
+        """
+        @type vote: Vote
+        """
+        self.writerow([
+            vote.user.username,
+            vote.section_label,
+            vote.datetime.isoformat(' '),
+            vote.user.editcount,
+            vote.user.first_edit.isoformat(' '),
+            vote.user.get_global_editcount() or '-',
+            vote.user.get_home_wiki() or 'commonswiki',
+            vote.get_plaintext(),
+        ])
+
+
 vote_page = VotePage(Api.from_domain(config.wiki), page=config.page, revision=config.revision, sections=config.sections)
+writer = CsvVoteWriter('votes.csv')
+for vote in vote_page.get_votes():
+    writer.write(vote)
