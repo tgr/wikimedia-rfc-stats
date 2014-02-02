@@ -22,10 +22,7 @@ import wikitools
 
 from config import wiki, page, revision, sections, date_format, date_locale, date_regexp
 
-endpoint = wikitools.wiki.Wiki("http://%s/w/api.php" % wiki)
-
 locale.setlocale(locale.LC_TIME, date_locale)
-
 
 class Vote:
     """Data about a single vote"""
@@ -93,6 +90,31 @@ class Vote:
         return str(self.__dict__)
 
 
+class Api:
+    endpoint = None
+
+    def call(self, **params):
+        return wikitools.api.APIRequest(self.endpoint, params).query(False)
+
+    @classmethod
+    def from_domain(cls, domain):
+        api = Api()
+        api.endpoint = wikitools.wiki.Wiki("http://%s/w/api.php" % domain)
+        return api
+
+    @classmethod
+    def from_globaluserinfo_url(cls, url):
+        api = Api()
+        api.endpoint = wikitools.wiki.Wiki("%s/w/api.php" % url)
+        return api
+
+    def __call__(self, **params):
+        return self.call(**params)
+
+
+api = Api.from_domain(wiki)
+
+
 def chunks(list, size):
     chunk = []
     list = iter(list)
@@ -106,9 +128,6 @@ def chunks(list, size):
 
     yield chunk
 
-
-def api(**params):
-    return wikitools.api.APIRequest(endpoint, params).query()
 
 def get_section_text(section):
     params = {
@@ -135,20 +154,59 @@ def get_votes():
         for line in get_vote_lines(section_id):
             yield Vote.from_line(line, section_label)
 
+def timestamp_to_datetime(timestamp):
+    return datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ')
+
 def get_user_data(user):
     data = api(action='query',
-                list='users',
-                    ususers=user, usprop='editcount|groups',
-                meta='globaluserinfo', guiuser=user, guiprop='editcount|groups')['query']
+                list='users|usercontribs',
+                    ususers=user, usprop='editcount|groups|registration',
+                    ucuser=user, ucdir='newer', uclimit=1, ucprop='timestamp',
+                meta='globaluserinfo', guiuser=user, guiprop='editcount|groups|merged')['query']
     local_data = data['users'][0]
     global_data = data['globaluserinfo']
-    data = api(action='query',
-                list='usercontribs',
-                    ucuser=user, ucdir='newer', uclimit=1, ucprop='timestamp')['query']
-    return data, local_data, global_data
+    first_local_edit = data['usercontribs'][0]['timestamp']
 
-def get_local_first_contrib(user):
-    return api(action='query', list='usercontribs', )
+    merged = False
+    for account in global_data['merged']:
+        if account['wiki'] == 'commonswiki':
+            merged = True
+            break
+
+    data = {
+        'merged': False,
+        'home_wiki': 'commonswiki',
+        'local_edits': local_data['editcount'],
+        'local_groups': local_data['groups'],
+        'global_edits': local_data['editcount'],
+        'global_groups': local_data['groups'],
+        'first_local_edit': timestamp_to_datetime(first_local_edit),
+        'first_global_edit': timestamp_to_datetime(first_local_edit),
+    }
+
+    if merged:
+        data['merged'] = True
+        data['home_wiki'] = global_data['home']
+        data['global_edits'] = global_data['editcount']
+        first_global_edit = None
+        global_groups = []
+        for account in global_data['merged']:
+            print account['url']
+            account_api = Api.from_globaluserinfo_url(account['url'])
+            account_data = account_api(action='query', list='users|usercontribs',
+                                        ususers=user, usprop='groups',
+                                        ucuser=user, ucdir='newer', uclimit=1, ucprop='timestamp')['query']
+            global_groups.extend(account_data['users'][0]['groups'])
+            for edit in account_data['usercontribs']:
+                first_account_edit = timestamp_to_datetime(edit['timestamp'])
+                if not first_global_edit or first_account_edit < first_global_edit:
+                    first_global_edit = first_account_edit
+                break
+
+        data['first_global_edit'] = first_global_edit
+
+    return data
+
 
 def get_local_gap(user):
     return api(action='query', list='usercontribs', ucuser=user, ucdir='older', uclimit=500, ucprop='title|timestamp')
