@@ -16,206 +16,450 @@ Usage:
 * run rfc_stats.py
 """
 
-import re, locale, itertools
+import re
+import locale
 from datetime import datetime
 import wikitools
+import csv
 
-from config import wiki, page, revision, sections, date_format, date_locale, date_regexp
+import config
 
-locale.setlocale(locale.LC_TIME, date_locale)
+locale.setlocale(locale.LC_TIME, config.date_locale)
+
 
 class Vote:
     """Data about a single vote"""
 
-    vote = None
-    """One of the section labels"""
+    def __init__(self):
+        self.section_label = None
+        """
+        @type: str
+        One of the section labels
+        """
 
-    text = None
-    """Full text of the vote"""
+        self.text = None
+        """
+        @type: str
+        Full text of the vote
+        """
 
-    username = None
-    """Username without the User: prefix"""
+        self.user = None
+        """
+        @type: User
+        """
 
-    datetime = None
-    """datetime object with the time of the vote"""
+        self.datetime = None
+        """
+        time of the vote
+        @type : datetime.datetime
+        """
 
-    first_local_edit_date = None
-    """when did the user edit first on the wiki where the RFC took place?"""
+        self.local_gap = None
+        """time spent inactive on the local wiki before the RFC (months, rounded down)"""
 
-    first_global_edit_dare = None
-    """when did the user edit first, anywhere?"""
+        self.global_gap = None
+        """time spent inactive everywhere before the RFC (months, rounded down)"""
 
-    local_edits = None
-    """edit count on the wiki where the RFC took place"""
+    def __str__(self):
+        return str(self.to_dict())
 
-    global_edits = None
-    """global edit count"""
-
-    is_local_admin = None
-    """is the user an admin (bureaucrat, steward etc) on the wiki where the RFC took place?"""
-
-    is_global_admin = None
-    """is the user an admin (bureaucrat, steward etc) anywhere?"""
-
-    local_gap = None
-    """time spent inactive on the local wiki before the RFC (months, rounded down)"""
-
-    global_gap = None
-    """time spent inactive everywhere before the RFC (months, rounded down)"""
+    def to_dict(self):
+        self_dict = self.__dict__
+        if self_dict['user']:
+            self_dict['user'] = self_dict['user'].to_dict()
+        return self_dict
 
     @classmethod
-    def from_line(cls, line, section_label):
-        vote = Vote()
-        vote.vote = section_label
+    def from_line(cls, page, line, section_label):
+        """
+        Creates a Vote from a line of text (which should contain a signature). There is no sanity check done
+        to see if it is indeed a vote.
+        @type page: VotePage
+        @type line: str
+        @type section_label: str
+        @rtype: Vote
+        """
+        vote = cls()
+        vote.section_label = section_label
         vote.text = line
-        vote.username = Vote.get_username(line)
-        vote.datetime = Vote.get_datetime(line)
+        vote.datetime = cls.get_datetime(line)
 
-        user_data = get_user_data(vote.username)
+        username = cls.get_username(line)
+        vote.user = User(page.api, username)
+        vote.user.load_data()
+
         return vote
 
-    @classmethod
-    def get_username(cls, line):
+    @staticmethod
+    def get_username(line):
+        """
+        @type line: str
+        @rtype: str
+        """
         m = re.search(r'\[\[User(?:_talk)?:([^|\]]+)', line)
         if m:
             return m.group(1)
 
-    @classmethod
-    def get_datetime(cls, line):
-        m = re.search(date_regexp, line)
+    @staticmethod
+    def get_datetime(line):
+        """
+        @type line: str
+        @rtype: str
+        """
+        m = re.search(config.date_regexp, line)
         if m:
-            return datetime.strptime(m.group(0), date_format)
+            return datetime.strptime(m.group(0), config.date_format)
 
-    def __str__(self):
-        return str(self.__dict__)
+    @staticmethod
+    def filter_vote_lines(lines):
+        """
+        Iterates through a set of lines and only returns those which seem to be votes (top-level ordered lists).
+        @type lines: collections.Iterable[string]
+        """
+        for line in lines:
+            if re.match(r'#[^#*:]', line):
+                yield line
+
+    def get_plaintext(self):
+        return re.sub(r'<.*?>', '', self.text)
 
 
 class Api:
     endpoint = None
+    """@type wikitools.wiki.Wiki"""
 
-    def call(self, **params):
-        return wikitools.api.APIRequest(self.endpoint, params).query(False)
+    def __init__(self, endpoint):
+        """
+        @type endpoint: wikitools.wiki.Wiki
+        """
+        assert isinstance(endpoint, wikitools.wiki.Wiki)
+        self.endpoint = endpoint
 
     @classmethod
     def from_domain(cls, domain):
-        api = Api()
-        api.endpoint = wikitools.wiki.Wiki("http://%s/w/api.php" % domain)
-        return api
+        """
+        @type domain: string
+        @rtype: Api
+        """
+        return cls(wikitools.wiki.Wiki("http://%s/w/api.php" % domain))
 
     @classmethod
     def from_globaluserinfo_url(cls, url):
-        api = Api()
-        api.endpoint = wikitools.wiki.Wiki("%s/w/api.php" % url)
-        return api
+        """
+        @type url: string
+        @rtype: Api
+        """
+        return cls(wikitools.wiki.Wiki("%s/w/api.php" % url))
+
+    @staticmethod
+    def timestamp_to_datetime(timestamp):
+        """
+        @type timestamp: string
+        @rtype: datetime.datetime
+        """
+        return datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ')
+
+    @staticmethod
+    def chunks(seq, size):
+        """
+        Chops a list or iterable into segments.
+        @type seq: list
+        @type size: int
+        """
+        chunk = []
+        seq = iter(seq)
+        try:
+            for i in range(size):
+                chunk.append(next(seq))
+        except StopIteration:
+            if len(chunk) > 0:
+                yield chunk
+            return
+
+        yield chunk
+
+    def call(self, **params):
+        """
+        Makes a call to the API. Pass API parameters as function parameters: api.call(action='query', list='users', ...
+        @rtype: dict
+        """
+        return wikitools.api.APIRequest(self.endpoint, params).query(False)
 
     def __call__(self, **params):
         return self.call(**params)
 
+    def get_section_text(self, page=None, revision=None, section=None):
+        """
+        Returns the text of the specified section. section is required; one of page and revision is required.
+        @type page: str
+        @type revision: int
+        @type section: int
+        @rtype: str
+        """
+        if not section or not page and not revision:
+            raise ValueError('section and either page or revision is required')
 
-api = Api.from_domain(wiki)
+        params = {
+            'action': 'query',
+            'prop': 'revisions',
+            'rvsection': section,
+            'rvprop': 'content'
+        }
+        if revision:
+            params['revids'] = revision
+        else:
+            params['titles'] = page
+        for p in self(**params)['query']['pages'].values():
+            for r in p['revisions']:
+                return r['*']
 
 
-def chunks(list, size):
-    chunk = []
-    list = iter(list)
-    try:
-        for i in range(size):
-            chunk.append(next(list))
-    except StopIteration:
-        if len(chunk) > 0:
-            yield chunk
-        return
+class VotePage:
+    def __init__(self, api, page=None, revision=None, sections=None):
+        """
+        @type api: Api
+        @type page: str
+        @type revision: int
+        @type sections: dict[str, int]
+        """
+        if not sections or not page and not revision:
+            raise ValueError('sections and either page or revision is required')
 
-    yield chunk
+        self.api = api
+        """@type: Api"""
 
+        self.page = page
+        """
+        Page name (ignored if there is a revision id)
+        @type: str
+        """
 
-def get_section_text(section):
-    params = {
-        'action': 'query',
-        'prop': 'revisions',
-        'rvsection': section,
-        'rvprop': 'content'
-    }
-    if revision:
-        params['revids'] = revision
-    else:
-        params['titles'] = page
-    for p in api(**params)['query']['pages'].values():
-        for r in p['revisions']:
-            return r['*']
+        self.revision = revision
+        """
+        Revision id to analyze, None for current
+        @type: int
+        """
 
-def get_vote_lines(section):
-    for line in get_section_text(section).splitlines():
-        if re.match(r'#[^#*:]', line):
+        self.sections = sections
+        """
+        Section ids and internal labels (will be used in the output)
+        @type: dict[str, int]
+        """
+
+    def get_page_arg(self):
+        arg = {}
+        if self.revision:
+            arg['revision'] = self.revision
+        else:
+            arg['page'] = self.page
+        return arg
+
+    def get_vote_lines(self, section):
+        """
+        @type section: int
+        """
+        args = self.get_page_arg()
+        args['section'] = section
+        all_lines = self.api.get_section_text(page=self.page, revision=self.revision, section=section).splitlines()
+        for line in Vote.filter_vote_lines(all_lines):
             yield line
 
-def get_votes():
-    for section_label, section_id in sections.items():
-        for line in get_vote_lines(section_id):
-            yield Vote.from_line(line, section_label)
+    def get_votes(self, section=None, limit=None):
+        """
+        @type section: int|str
+        @param section: limit votes to a single section
+        @type limit: int
+        @param limit: only return a limited number of votes
+        """
+        i = 0
+        for section_label, section_id in self.sections.items():
+            if section and section_label != section and section_id != section:
+                continue
+            for line in self.get_vote_lines(section_id):
+                i += 1
+                yield Vote.from_line(self, line, section_label)
+                if i == limit:
+                    return
 
-def timestamp_to_datetime(timestamp):
-    return datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ')
 
-def get_user_data(user):
-    data = api(action='query',
-                list='users|usercontribs',
-                    ususers=user, usprop='editcount|groups|registration',
-                    ucuser=user, ucdir='newer', uclimit=1, ucprop='timestamp',
-                meta='globaluserinfo', guiuser=user, guiprop='editcount|groups|merged')['query']
-    local_data = data['users'][0]
-    global_data = data['globaluserinfo']
-    first_local_edit = data['usercontribs'][0]['timestamp']
+class GlobalUser:
+    def __init__(self, username):
+        """
+        @type username: str
+        """
 
-    merged = False
-    for account in global_data['merged']:
-        if account['wiki'] == 'commonswiki':
-            merged = True
-            break
+        self.username = username
+        """
+        @type str
+        """
 
-    data = {
-        'merged': False,
-        'home_wiki': 'commonswiki',
-        'local_edits': local_data['editcount'],
-        'local_groups': local_data['groups'],
-        'global_edits': local_data['editcount'],
-        'global_groups': local_data['groups'],
-        'first_local_edit': timestamp_to_datetime(first_local_edit),
-        'first_global_edit': timestamp_to_datetime(first_local_edit),
-    }
+        self.home_wiki = None
+        """
+        Home wiki db name (enwiki, frsource etc)
+        @type: str
+        """
 
-    if merged:
-        data['merged'] = True
-        data['home_wiki'] = global_data['home']
-        data['global_edits'] = global_data['editcount']
-        first_global_edit = None
-        global_groups = []
+        self.wikis = None
+        """
+        List of wiki db names where the user has an account
+        @type: list[str]
+        """
+
+        self.wiki_urls = None
+        """
+        List of wiki URLs (schema + domain, no trailing slash) where the user has an account
+        @type: list[str]
+        """
+
+        self.editcount = None
+        """
+        @type: int
+        """
+
+        self.groups = None
+        """
+        A union of all the group roles held at some wiki
+        @type: list[str]
+        """
+
+        self.first_edit = None
+        """
+        @type: datetime.datetime
+        """
+
+    def __str__(self):
+        return str(self.to_dict())
+
+    def to_dict(self):
+        self_dict = self.__dict__
+        del self_dict['wikis']
+        del self_dict['wiki_urls']
+        return self_dict
+
+    @classmethod
+    def from_globaluserinfo(cls, username, global_data):
+        """
+        @type username: str
+        @type global_data: dict
+        """
+        user = cls(username)
+        user.home_wiki = global_data['home']
+        user.editcount = global_data['editcount']
+        user.wikis = []
+        user.wiki_urls = []
+
         for account in global_data['merged']:
-            print account['url']
-            account_api = Api.from_globaluserinfo_url(account['url'])
-            account_data = account_api(action='query', list='users|usercontribs',
-                                        ususers=user, usprop='groups',
-                                        ucuser=user, ucdir='newer', uclimit=1, ucprop='timestamp')['query']
-            global_groups.extend(account_data['users'][0]['groups'])
-            for edit in account_data['usercontribs']:
-                first_account_edit = timestamp_to_datetime(edit['timestamp'])
-                if not first_global_edit or first_account_edit < first_global_edit:
-                    first_global_edit = first_account_edit
-                break
+            user.wikis.append(account['wiki'])
+            user.wiki_urls.append(account['url'])
 
-        data['first_global_edit'] = first_global_edit
+        return user
 
-    return data
+    def load_data(self):
+        self.groups = []
+        for url in self.wiki_urls:
+            api = Api.from_globaluserinfo_url(url)
+            data = api(action='query', list='users|usercontribs',
+                                   ususers=self.username, usprop='groups',
+                                   ucuser=self.username, ucdir='newer', uclimit=1, ucprop='timestamp')['query']
+
+            self.groups.extend(data['users'][0]['groups'])
+            if len(data['usercontribs']):
+                first_edit_on_this_wiki = Api.timestamp_to_datetime(data['usercontribs'][0]['timestamp'])
+                if not self.first_edit or first_edit_on_this_wiki < self.first_edit:
+                    self.first_edit = first_edit_on_this_wiki
 
 
-def get_local_gap(user):
-    return api(action='query', list='usercontribs', ucuser=user, ucdir='older', uclimit=500, ucprop='title|timestamp')
+class User:
+    def __init__(self, api, username):
+        """
+        @type api: Api
+        @param api: Api object to the user's wiki
+        """
+
+        self.api = api
+        """@type: Api"""
+
+        self.username = username
+        """Username without the User: prefix"""
+
+        self.global_user = None
+        """
+        None means uninitialized, False means not attached.
+        @type: GlobalUser
+        """
+
+        self.editcount = None
+        """
+        @type: int
+        """
+
+        self.groups = None
+        """
+        @type: list[str]
+        """
+
+        self.first_edit = None
+        """
+        @type: datetime.datetime
+        """
+
+    def __str__(self):
+        return str(self.to_dict())
+
+    def to_dict(self):
+        self_dict = self.__dict__
+        if self_dict['global_user']:
+            self_dict['global_user'] = self_dict['global_user'].to_dict()
+        return self_dict
+
+    def is_admin(self):
+        return 'sysop' in self.groups
+
+    def load_data(self, data=None):
+        if not data:
+            data = self.api(action='query',
+                            list='users|usercontribs',
+                                ususers=self.username, usprop='editcount|groups|registration',
+                                ucuser=self.username, ucdir='newer', uclimit=1, ucprop='timestamp',
+                            meta='globaluserinfo', guiuser=self.username, guiprop='editcount|groups|merged')['query']
+        local_data = data['users'][0]
+        global_data = data['globaluserinfo']
+        first_local_edit = data['usercontribs'][0]['timestamp']
+
+        self.groups = local_data['groups']
+        self.editcount = local_data['editcount']
+        self.first_edit = Api.timestamp_to_datetime(first_local_edit)
+
+        if self.data_is_global(global_data):
+            self.global_user = GlobalUser.from_globaluserinfo(self.username, global_data)
+            #self.global_user.load_data()
+        else:
+            self.global_user = False
+
+    def data_is_global(self, global_data):
+        merged = False
+        if 'merged' in global_data:
+            for account in global_data['merged']:
+                if account['wiki'] == 'commonswiki':
+                    merged = True
+                    break
+        return merged
+
+    def get_local_gap(self, user):
+        data = self.api(action='query',
+                        list='usercontribs', ucuser=self.username, ucdir='older', uclimit=500, ucprop='title|timestamp')
+
+    def get_global_editcount(self):
+        if self.global_user:
+            return self.global_user.editcount
+        else:
+            return None
+
+    def get_home_wiki(self):
+        if self.global_user:
+            return self.global_user.home_wiki
+        else:
+            return None
 
 
-i = 0
-for vote in []:#get_votes():
-    i = i + 1
-    if i > 0:
-        break
-
-print get_user_data('Tgr')
+vote_page = VotePage(Api.from_domain(config.wiki), page=config.page, revision=config.revision, sections=config.sections)
