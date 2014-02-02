@@ -15,6 +15,7 @@ Usage:
 * copy config.dist.py to config.py, edit settings
 * run rfc_stats.py
 """
+from collections import OrderedDict
 
 import re
 import locale
@@ -22,10 +23,12 @@ from datetime import datetime
 import codecs
 import wikitools
 import csv
+import HTMLParser
 
 import config
 
 locale.setlocale(locale.LC_TIME, config.date_locale)
+html_parser = HTMLParser.HTMLParser()
 
 
 class Vote:
@@ -83,26 +86,36 @@ class Vote:
         vote = cls()
         vote.section_label = section_label
         vote.text = line
-        vote.datetime = cls.get_datetime(line)
+        vote.datetime = cls.parse_datetime(line)
 
-        username = cls.get_username(line)
-        vote.user = User(page.api, username)
-        vote.user.load_data()
+        username = cls.parse_username(line)
+        if username:
+            vote.user = User(page.api, username)
+            try:
+                vote.user.load_data()
+            except NoSuchUserException:
+                vote.user = None
+            except:
+                print(vote.text)
+                raise
 
         return vote
 
     @staticmethod
-    def get_username(line):
+    def parse_username(line):
         """
         @type line: str
         @rtype: str
         """
-        m = re.search(r'\[\[User(?:_talk)?:([^|\]]+)', line)
+        # some people use @[[User:Foo]] to refer to others, so we skip sigs starting with those
+        m = re.search(r'[^@]\[\[User(?:_talk)?:([^|\]]+)', line)
         if m:
-            return m.group(1)
+            username = m.group(1)
+            # some people write their usernames in weird ways in their signatures
+            return html_parser.unescape(username)
 
     @staticmethod
-    def get_datetime(line):
+    def parse_datetime(line):
         """
         @type line: str
         @rtype: str
@@ -122,7 +135,7 @@ class Vote:
                 yield line
 
     def get_plaintext(self):
-        return re.sub(r'<.*?>', '', self.text)
+        return html_parser.unescape(re.sub(r'<.*?>', '', self.text))
 
 
 class Api:
@@ -241,11 +254,20 @@ class VotePage:
         @type: int
         """
 
-        self.sections = sections
+        self.sections = self.create_ordered_dict(sections)
         """
         Section ids and internal labels (will be used in the output)
-        @type: dict[str, int]
+        @type: OrderedDict[str, int]
         """
+
+    @staticmethod
+    def create_ordered_dict(sections):
+        """
+        Orders sections by
+        @type sections: dict[str, int]
+        @rtype: OrderedDict[str, int]
+        """
+        return OrderedDict(sorted(sections.items(), key=lambda t: t[1]))
 
     def get_page_arg(self):
         arg = {}
@@ -370,6 +392,10 @@ class GlobalUser:
                     self.first_edit = first_edit_on_this_wiki
 
 
+class NoSuchUserException(BaseException):
+    pass
+
+
 class User:
     def __init__(self, api, username):
         """
@@ -427,6 +453,9 @@ class User:
             local_data = data['users'][0]
             global_data = data['globaluserinfo']
 
+            if 'missing' in local_data or 'invalid' in local_data:
+                raise NoSuchUserException(self.username)
+
             self.groups = local_data['groups']
             self.editcount = local_data['editcount']
 
@@ -439,7 +468,7 @@ class User:
             else:
                 self.global_user = False
         except:
-            print(data)
+            print(self.username, data)
             raise
 
     def data_is_global(self, global_data):
@@ -482,7 +511,13 @@ class CsvVoteWriter:
 
         self.writer = csv.writer(self.file)
         self.writerow(['User', '!vote section', '!vote date', 'Commons edit count', 'First Commons edit',
-                              'Global edit count', 'Home wiki', 'Full text'])
+                       'Global edit count', 'Home wiki', 'Full text'])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.file.close()
 
     def writerow(self, row):
         """
@@ -496,18 +531,19 @@ class CsvVoteWriter:
         @type vote: Vote
         """
         self.writerow([
-            vote.user.username,
+            vote.user.username if vote.user else '-',
             vote.section_label,
-            vote.datetime.isoformat(' '),
-            vote.user.editcount,
-            vote.user.first_edit.isoformat(' '),
-            vote.user.get_global_editcount() or '-',
-            vote.user.get_home_wiki() or 'commonswiki',
+            vote.datetime.isoformat(' ') if vote.datetime else '-',
+            vote.user.editcount if vote.user else '-',
+            vote.user.first_edit.isoformat(' ') if vote.user else '-',
+            vote.user.get_global_editcount() or '-' if vote.user else '-',
+            vote.user.get_home_wiki() or 'commonswiki' if vote.user else '-',
             vote.get_plaintext(),
         ])
 
 
 vote_page = VotePage(Api.from_domain(config.wiki), page=config.page, revision=config.revision, sections=config.sections)
-writer = CsvVoteWriter('votes.csv')
-for vote in vote_page.get_votes():
-    writer.write(vote)
+with CsvVoteWriter('votes.csv') as writer:
+    for i, vote in enumerate(vote_page.get_votes()):
+        writer.write(vote)
+        print('%d: %s' % (i, vote.user.username if vote.user else '-'))
