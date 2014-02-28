@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8  -*-
 """
-Calculates participant statictics for MediaWiki RFC-s/votes/etc.
+Calculates participant statistics for MediaWiki RFC-s/votes/etc.
 
 Assumptions:
 * RFC is on a single page, with each position having its own section
